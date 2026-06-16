@@ -1,0 +1,45 @@
+services:
+  pipeline:
+    build: .
+    image: point-cloud-pipeline:latest
+    container_name: pc_pipeline_ingest
+    volumes:
+      # Mount source code individually — avoids pulling the Windows .venv
+      # and platform-specific binaries into the Linux container.
+      - ./src:/app/src
+      - ./run_pipeline.py:/app/run_pipeline.py
+      # Named volume shared with the API service so the database file
+      # is accessible without copying across containers.
+      - db_storage:/app/data
+    command: >
+      python run_pipeline.py
+      --grid-size 8
+      --voxel-size 2.0
+      --workers 4
+      --db-path /app/data/point_cloud_pipeline.db
+    environment:
+      - PYTHONUNBUFFERED=1
+
+  api:
+    build: .
+    image: point-cloud-pipeline:latest
+    container_name: pc_voxel_api
+    ports:
+      - "8000:8000"
+    volumes:
+      # Source code mount for the API module
+      - ./src:/app/src
+      # Same named volume: the DB written by the pipeline is visible here
+      - db_storage:/app/data
+    environment:
+      - DB_PATH=/app/data/point_cloud_pipeline.db
+      - PYTHONUNBUFFERED=1
+    # Ensure the API only boots up after the ingestion pipeline completes successfully
+    depends_on:
+      pipeline:
+        condition: service_completed_successfully
+
+# Named volume persists the DuckDB file between container restarts.
+# To inspect it on the host: docker cp pc_voxel_api:/app/data/point_cloud_pipeline.db .
+volumes:
+  db_storage:
