@@ -1,0 +1,9 @@
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+temp_parquet/
+point_cloud_pipeline.db
+point_cloud_pipeline.db.wal
+.DS_Store

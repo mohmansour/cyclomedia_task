@@ -1,0 +1,8 @@
+laspy[lazrs]>=2.5.0
+requests>=2.31.0
+numpy>=1.26.0
+pandas>=2.2.0
+duckdb>=0.10.0
+pyarrow>=15.0.0
+fastapi>=0.110.0
+uvicorn>=0.28.0
