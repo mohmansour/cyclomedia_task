@@ -18,7 +18,7 @@ class FetchMetadataTask(Task):
     Task 1: Connects to the remote COPC file, fetches global metadata, 
     and divides the 2D bounding box into a grid of spatial chunks.
     """
-    def __init__(self, copc_url: str, grid_size: int, voxel_size: float, db_path: str, temp_dir: str, max_workers: int = 4, filter_outliers: bool = True, max_chunks: int = None):
+    def __init__(self, copc_url: str, grid_size: int, voxel_size: float, db_path: str, temp_dir: str, max_workers: int = 4, filter_outliers: bool = True, max_chunks: int = None, resume_failed: bool = False):
         super().__init__(name="FetchMetadata", retries=3, retry_delay=5.0)
         self.copc_url = copc_url
         self.grid_size = grid_size
@@ -28,6 +28,7 @@ class FetchMetadataTask(Task):
         self.max_workers = max_workers
         self.filter_outliers = filter_outliers
         self.max_chunks = max_chunks
+        self.resume_failed = resume_failed
 
     def run(self, context: Dict[str, Any]) -> Dict[str, Any]:
         logger.info(f"Connecting to COPC dataset: {self.copc_url}")
@@ -67,6 +68,24 @@ class FetchMetadataTask(Task):
                 
         logger.info(f"Created {len(chunks)} spatial chunks grid ({self.grid_size}x{self.grid_size}).")
         
+        # If resume_failed is active, load failed chunks from database and filter
+        if self.resume_failed:
+            import json
+            if not os.path.exists(self.db_path):
+                raise FileNotFoundError(f"Database file '{self.db_path}' not found. Cannot resume ingestion.")
+                
+            with DatabaseManager(self.db_path, read_only=True) as db:
+                failed_chunks_str = db.get_metadata("failed_chunks", "[]")
+                failed_chunk_ids = json.loads(failed_chunks_str)
+                
+            if not failed_chunk_ids:
+                logger.info("No failed chunks found in database metadata. Ingestion is already complete.")
+                # We return an empty chunk list, subsequent task will know
+                chunks = []
+            else:
+                chunks = [c for c in chunks if c["id"] in failed_chunk_ids]
+                logger.info(f"Resume Mode: Filtered to {len(chunks)} previously failed chunks: {failed_chunk_ids}")
+        
         # Prepare intermediate temp directory
         if os.path.exists(self.temp_dir):
             logger.info(f"Clearing existing temporary directory: {self.temp_dir}")
@@ -85,23 +104,47 @@ class FetchMetadataTask(Task):
             "maxs": maxs,
             "max_workers": self.max_workers,
             "filter_outliers": self.filter_outliers,
-            "max_chunks": self.max_chunks
+            "max_chunks": self.max_chunks,
+            "resume_failed": self.resume_failed
         }
+
 
 
 def _process_single_chunk(chunk: Dict[str, Any], copc_url: str, voxel_size: float, temp_dir: str, filter_outliers: bool) -> tuple:
     """
     Helper function run within ThreadPoolExecutor to download and process one chunk.
+    Includes chunk-level retry logic with exponential backoff.
     """
+    import time
     chunk_id = chunk["id"]
     query_box = laspy.Bounds(
         mins=[chunk["xmin"], chunk["ymin"]],
         maxs=[chunk["xmax"], chunk["ymax"]]
     )
     
-    # Open reader inside thread so each HTTP request is self-contained and parallelized
-    with CopcReader.open(copc_url) as reader:
-        points = reader.query(query_box)
+    max_retries = 3
+    base_delay = 1.0
+    points = None
+    last_err = None
+    
+    for attempt in range(1, max_retries + 1):
+        try:
+            # Open reader inside thread so each HTTP request is self-contained and parallelized
+            with CopcReader.open(copc_url) as reader:
+                points = reader.query(query_box)
+            break
+        except Exception as e:
+            last_err = e
+            if attempt < max_retries:
+                delay = base_delay * (2 ** (attempt - 1))
+                logger.warning(
+                    f"Chunk {chunk_id} download failed (Attempt {attempt}/{max_retries}). "
+                    f"Retrying in {delay:.1f}s... Error: {str(e)}"
+                )
+                time.sleep(delay)
+            else:
+                logger.error(f"Chunk {chunk_id} download failed after {max_retries} attempts.")
+                raise last_err
         
     num_points = len(points)
     if num_points > 0:
@@ -120,6 +163,7 @@ def _process_single_chunk(chunk: Dict[str, Any], copc_url: str, voxel_size: floa
         voxels_df.to_parquet(out_path, index=False)
         return out_path, num_points, num_voxels
     return None, 0, 0
+
 
 
 class ProcessChunksTask(Task):
@@ -240,10 +284,30 @@ class SaveToStorageTask(Task):
         logger.info(f"Connecting to DuckDB storage at {db_path}...")
         
         with DatabaseManager(db_path) as db:
-            # Drop and fully recreate the table on every run.
-            # This is safe and O(1): cascades the DROP to any lingering
-            # idx_voxel_coords index, so create_indexes() always builds fresh.
-            db.reset_storage()
+            import json
+            
+            resume_failed = meta.get("resume_failed", False)
+            if resume_failed:
+                logger.info("Resume Mode active. Appending data without resetting database table...")
+                
+                # Fetch previously failed list
+                prev_failed_str = db.get_metadata("failed_chunks", "[]")
+                try:
+                    prev_failed_list = json.loads(prev_failed_str)
+                except Exception:
+                    prev_failed_list = []
+                
+                processed_chunk_ids = {c["id"] for c in meta["chunks"]}
+                # Remove successfully recovered chunks from failed list
+                updated_failed_list = [cid for cid in prev_failed_list if cid not in processed_chunk_ids]
+                # Re-add any that failed again in this attempt
+                for cid in process_result.get("failed_chunks", []):
+                    if cid not in updated_failed_list:
+                        updated_failed_list.append(cid)
+            else:
+                logger.info("Standard Mode active. Resetting database storage...")
+                db.reset_storage()
+                updated_failed_list = process_result.get("failed_chunks", [])
             
             # Use DuckDB native parquet reader to bulk load files
             # Note: We escape backslashes in path for Windows compatibility
@@ -254,13 +318,12 @@ class SaveToStorageTask(Task):
             db.conn.execute(f"INSERT INTO processed_voxels SELECT * FROM read_parquet('{escaped_temp_path}')")
             
             # Save metadata configuration
-            import json
             db.set_metadata("voxel_size", meta["voxel_size"])
             db.set_metadata("grid_size", meta["grid_size"])
             db.set_metadata("copc_url", meta["copc_url"])
             db.set_metadata("point_count", meta["point_count"])
             db.set_metadata("filter_outliers", meta["filter_outliers"])
-            db.set_metadata("failed_chunks", json.dumps(process_result.get("failed_chunks", [])))
+            db.set_metadata("failed_chunks", json.dumps(updated_failed_list))
             
             # Create indexing for fast query performance
             db.create_indexes()
@@ -273,6 +336,7 @@ class SaveToStorageTask(Task):
             logger.info(f"  Voxel X range: {stats['x_range']}")
             logger.info(f"  Voxel Y range: {stats['y_range']}")
             logger.info(f"  Voxel Z range: {stats['z_range']}")
+
             
         # Clean up temporary Parquet files
         try:

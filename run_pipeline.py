@@ -150,6 +150,11 @@ def main():
         default=None,
         help="Limit the number of chunks processed for quick testing/reproduction"
     )
+    parser.add_argument(
+        "--resume-failed",
+        action="store_true",
+        help="Load failed chunks from database metadata and re-run only those partitions"
+    )
     
     args = parser.parse_args()
     
@@ -171,7 +176,8 @@ def main():
         temp_dir=args.temp_dir,
         max_workers=args.workers,
         filter_outliers=not args.no_filter,
-        max_chunks=args.max_chunks
+        max_chunks=args.max_chunks,
+        resume_failed=args.resume_failed
     )
     process_chunks = ProcessChunksTask()
     save_to_storage = SaveToStorageTask()
@@ -190,10 +196,21 @@ def main():
     
     start_time = time.time()
     try:
-        pipeline.run()
+        context = pipeline.run()
         duration = time.time() - start_time
         logger.info(f"Pipeline executed successfully in {duration:.2f} seconds.")
         
+        # Check for failed chunks in context
+        process_res = context.get("ProcessChunks", {})
+        failed_chunks = process_res.get("failed_chunks", [])
+        if failed_chunks:
+            print("\n" + "!"*70)
+            print("WARNING: SOME CHUNKS FAILED TO PROCESS DURING THIS RUN!")
+            print(f"Failed Chunk IDs: {failed_chunks}")
+            print("You can recover and resume these failed partitions by running:")
+            print(f"  python run_pipeline.py --resume-failed --db-path {args.db_path} --workers {args.workers}")
+            print("!"*70 + "\n")
+            
         # Run verification queries at the end
         run_verification_queries(args.db_path)
         

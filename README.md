@@ -53,12 +53,19 @@ graph TD
   ```bash
   python run_pipeline.py --grid-size 8 --voxel-size 2.0 --workers 6
   ```
+- **Resuming Failed Chunks (Recovery Mode)**:
+  If any chunks failed to download during a previous run, their IDs are stored in the DuckDB metadata. You can re-run and append *only* those failed partitions:
+  ```bash
+  python run_pipeline.py --resume-failed
+  ```
 
 *Ingestion CLI Options:*
 - `--grid-size`: Division of 2D space (default: `8` for an 8x8 grid).
 - `--voxel-size`: Binned voxel cube size in coordinate units (default: `2.0` meters).
 - `--workers`: Parallel worker threads for remote streaming (default: `4`).
 - `--max-chunks`: Limit number of chunks processed (useful for testing).
+- `--resume-failed`: Load failed chunks from database metadata and re-run only those partitions (preserves and appends to existing database).
+
 
 ### Running the Web Service
 Once ingestion completes, start the FastAPI server:
@@ -103,7 +110,35 @@ Call the FastAPI endpoints to retrieve insights:
 
 ---
 
-## 4. Approach Section
+## 4. How to Run the Automated Test Suite
+
+We have implemented a comprehensive test suite using `pytest` that covers both individual unit correctness and pipeline integration flows (specifically testing download failure tolerance).
+
+### 1. Update Dependencies
+Ensure `pytest` and `httpx` are installed:
+```bash
+pip install -r requirements.txt
+```
+
+### 2. Run All Tests
+To run all tests with verbose output:
+```bash
+pytest tests/ -v
+```
+
+### 3. Key Areas Tested
+*   **Voxelization & Noise Filters (`tests/test_voxels.py`)**: Validates coordinate downsampling, $3\sigma$ filters, and NaN replacements.
+*   **DAG Scheduler Engine (`tests/test_dag.py`)**: Confirms Kahn's topological sort ordering, circular dependency guards, and task retry loops.
+*   **Storage & Database (`tests/test_database.py`)**: Asserts DuckDB schemas, index rebuilds, and configuration log stores.
+*   **FastAPI Routing (`tests/test_api.py`)**: Tests endpoints, bounding box parameter queries, and coordinate scaling logic.
+*   **Chunk Recovery & Resilience (`tests/test_pipeline_integration.py`)**:
+    *   Simulates a mock S3 download failure on a specific chunk. Asserts that the pipeline skips the chunk, writes warnings, completes successfully with remaining data, and saves failures to DuckDB metadata.
+    *   Simulates the `--resume-failed` run. Asserts that it reads metadata, pulls only the failed chunk, and appends the recovered data.
+
+---
+
+## 5. Approach Section
+
 
 ### How the Work was Scoped
 
